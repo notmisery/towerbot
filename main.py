@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import datetime
 from discord import app_commands, File, Intents, Interaction
 from discord.ext import commands
 from dotenv import load_dotenv
@@ -7,9 +7,9 @@ from urllib.request import urlopen
 import json
 import os
 import random
-import sys
-
-sys.path.insert(0, "venv/Lib/site-packages")
+import re
+import server_data
+import tb_embeds
 
 
 # =======UTILITIES=======
@@ -19,12 +19,7 @@ class ConfigurationFileException(Exception):
     pass
 
 
-# used in owner check
-class AccessDeniedMessage(commands.CheckFailure):
-    pass
-
-
-# =======INIT=======
+# =======CONFIGS=======
 
 # check if we have a config.json, and that it's valid
 try:
@@ -54,19 +49,19 @@ except (FileNotFoundError, json.JSONDecodeError, ConfigurationFileException) as 
 load_dotenv()
 TOKEN = os.getenv('TOKEN')
 
+
+# =======INIT=======
+
 bot = commands.Bot(command_prefix='t?', intents=Intents.all())
 
 print(f"Started at {str(datetime.utcnow())[:-16]}")
+bot.server_embed = None
 
 JETS = ["F16", "F18", "F15", "F35", "F22", "A10", "F14", "MIR2"]
 HOLDING_POINTS = ["A", "B", "C", "D"]
 AERODROMES = ["UG5X", "UG24", "UGKO", "UGKS", "URKA", "URKN", "URMM", "URSS"]
 RUNWAYS = ["22", "04"]
 DEPARTURES = ["GAM1D", "PAL1D", "ARN1D", "TIB1D", "SOR1D", "RUD1D", "AGI1D", "DIB1D", "TUN1D", "NAL1D"]
-server_player_count_url_dict = {'gaw': 'https://status.hoggitworld.com/f67eecc6-4659-44fd-a4fd-8816c993ad0e',
-                                'pgaw': 'https://status.hoggitworld.com/243bd8b1-3198-4c0b-817a-fadb40decf23',
-                                'lkeu': 'https://levant.eu.limakilo.net/status/data',
-                                'lkus': 'https://levant.na.limakilo.net/status/data'}
 
 
 def check_is_owner():
@@ -76,19 +71,17 @@ def check_is_owner():
         @bot.command()
         @check_is_owner()
         async def command(...):
-        will automatically say "Failed owner check." on failure
-    Args:
-        None
+        Commands with this check should not appear to any non-admin
     Returns:
-        True <or> AccessDeniedMessage | If owner is or is not in config
+        True or False | If owner is or is not in config
     """
 
-    def predicate(ctx):
-        if ctx.author.id not in cfg["OWNER_IDS"]:  # May not be coroutine-safe in the future, fine for now
-            raise AccessDeniedMessage("Failed owner check.")
+    def predicate(interaction: Interaction):
+        if interaction.user.id not in cfg["OWNER_IDS"]:  # May not be coroutine-safe in the future, fine for now
+            return False
         return True
 
-    return commands.check(predicate)
+    return app_commands.check(predicate)
 
 
 # =======EVENTS AND LOOPS=======
@@ -105,7 +98,8 @@ async def on_member_join(member):
     strip_text = {
         "slot": f"{time[11:16]}",
         "squawk": f"{random.randint(0, 6)}{random.randint(0, 7)}{random.randint(0, 7)}{random.randint(0, 7)}",
-        "callsign": f"{member.name.upper()[:4]}{random.randint(0, 9)}{random.randint(0, 9)}",
+        "callsign": (f"{re.sub('[^a-zA-Z0-9]', '', member.name.upper())[:4]}" 
+                     f"{random.randint(0, 9)}{random.randint(0, 9)}"),
         "aircraft": f"{random.choice(JETS)}",
         "hold": f"{random.choice(HOLDING_POINTS)}",
         "aerodrome": f"{random.choice(AERODROMES)}",
@@ -130,30 +124,41 @@ async def on_member_join(member):
     os.remove("strip.png")
 
 
-# =======BOT COMMANDS=======
-
-
-@bot.command()
-@check_is_owner()
-async def sync_command_tree(ctx):
-    await bot.tree.sync()
-    await ctx.reply(
-        "Tree synced.")
-
-
-@sync_command_tree.error
-async def sync_command_tree_error(ctx, error):
-    if isinstance(error, AccessDeniedMessage):
-        await ctx.reply(error)
-
-
 # =======APP COMMANDS=======
 
 
 @app_commands.command()
-async def ping(interaction: Interaction):
-    latency = str(bot.latency)[:-13]
-    await interaction.response.send_message(f"Pong! Ping is {latency}s.")
+@app_commands.describe(name="DCS server selection")
+@app_commands.choices(name=[
+    app_commands.Choice(name="Hoggit - Georgia At War", value="gaw"),
+    app_commands.Choice(name="Hoggit - Persian Gulf At War", value="pgaw"),
+    app_commands.Choice(name="Lima Kilo - Flashpoint Levant - EU", value="lkeu"),
+    app_commands.Choice(name="Lima Kilo - Flashpoint Levant - NA", value="lkna")
+])
+async def info(interaction: Interaction, name: app_commands.Choice[str], details: str = 'all'):
+    """
+    Gets player count info for designated servers
+    Args:
+        name | Choice[str] | Name of server
+        details | str | Wanted statistics, defaults to all
+    """
+    server = name.value  # take the actual string value from the input Choice
+    details = details.lower()
+
+    await interaction.response.send_message('Getting server data...')
+
+    stats = server_data.__getattr__(server)
+
+    if details == 'all':
+        await interaction.edit_original_response(content=', '.join(
+            [value for key, value in stats.items() if key not in {'players'}]))
+    elif details == 'players':
+        await interaction.edit_original_response(content='', embed=tb_embeds.PlayersEmbed(server, stats['players']))
+    else:
+        try:
+            await interaction.edit_original_response(content=stats[details])
+        except KeyError:
+            await interaction.edit_original_response(content="Requested data isn't available for that server.")
 
 
 @app_commands.command()
@@ -169,7 +174,8 @@ async def metar(interaction: Interaction, airport: str, decode: bool = False):
     else:  # If user wants decoded METAR
         try:
             with urlopen(
-                    f"https://beta.aviationweather.gov/cgi-bin/data/metar.php?ids={airport.upper()}&format=decoded") as x:
+                    f"https://beta.aviationweather.gov/cgi-bin/data/metar.php?ids={airport.upper()}&format=decoded")\
+                    as x:
                 data = x.read().decode("utf-8")
                 if not data:
                     raise ValueError("Response was empty.")
@@ -180,61 +186,53 @@ async def metar(interaction: Interaction, airport: str, decode: bool = False):
 
 
 @app_commands.command()
-@app_commands.describe(name="DCS server selection")
-@app_commands.choices(name=[
-    app_commands.Choice(name="Hoggit - Georgia At War", value="gaw"),
-    app_commands.Choice(name="Hoggit - Persian Gulf At War", value="pgaw"),
-    app_commands.Choice(name="Lima Kilo - Flashpoint Levant - EU", value="lkeu"),
-    app_commands.Choice(name="Lima Kilo - Flashpoint Levant - NA", value="lkna") 
-])
-async def info(interaction: Interaction, name: app_commands.Choice[str], details: str = 'all'):
-    """
-    Gets player count info for designated servers
-    Args:
-        name | Choice[str] | Name of server
-        *sub_cats | tuple | List of wanted statistics, blank sends all
-    """
-    name = name.value  # take the actual string value from the input Choice
-    details = details.lower()
+async def opt_in(interaction: Interaction, dcs_username: str):
+    server_data.log_user(dcs_username, True)
+    await interaction.response.send_message(f"You've opted in to Digital Controllers events under the username `{dcs_username}`.")
 
-    try:
-        with urlopen(server_player_count_url_dict[name]) as pipe:
-            response = pipe.read().decode('utf-8')
-    except KeyError:  # If name isn't in server_player_count_url_dict then prevents execution
-        await interaction.response.send_message('Specified DCS server could not be found')
-        return
-    except:  # PEP8 is screaming at me, but I don't know enough about urllib to figure out what error is thrown
-        await interaction.response.send_message('Something went wrong trying to get the data. Try again, maybe?')
-        return
 
-    response_dict = json.loads(response)
+@app_commands.command()
+async def opt_out(interaction: Interaction, dcs_username: str):
+    server_data.log_user(dcs_username, False)
+    await interaction.response.send_message(f"You've opted out of Digital Controllers events under the username `{dcs_username}`.")
 
-    # Deal with different servers formatting json differently
-    if name in {'gaw', 'pgaw'}:
-        seconds_to_restart = timedelta(seconds=14400 - int(response_dict['data']['uptime']))
-        response_strings = {'players': f"{int(response_dict['players']) - 1} player(s) online",  # Account for slmod?
-                            'restart': f"Restart <t:{round((datetime.now() + seconds_to_restart).timestamp())}:R> ("
-                                       f"may be inaccurate)",
-                            'metar': f"METAR: {response_dict['data']['metar']}"}
-    elif name in {'lkeu', 'lkus'}:
-        seconds_to_restart = timedelta(seconds=int(response_dict['restartPeriod']) - int(response_dict['modelTime']))
-        response_strings = {'players': f"{int(response_dict['players']['current']) - 1} player(s) online",
-                            # Account for lk_admin
-                            'restart': f"Restart <t:{round((datetime.now() + seconds_to_restart).timestamp())}:R>"}
 
-    if details == 'all':
-        await interaction.response.send_message(' | '.join(response_strings.values()))
+@app_commands.command()
+async def ping(interaction: Interaction):
+    latency = str(bot.latency)[:-13]
+    await interaction.response.send_message(f"Pong! Ping is {latency}s.")
+
+
+@app_commands.command()
+@check_is_owner()
+async def sync_command_tree(interaction: Interaction):
+    await bot.tree.sync()
+    await interaction.response.send_message("Tree synced.", ephemeral=True)
+
+
+@app_commands.command()
+@check_is_owner()
+async def update_embed(interaction: Interaction):
+    if bot.server_embed:
+        await interaction.response.send_message("Embed update sequence has begun.", ephemeral=True)
+        await bot.server_embed.update_embed()
     else:
+        await interaction.response.send_message("Embed could not be found, creating new embed.", ephemeral=True)
         try:
-            await interaction.response.send_message(response_strings[details])
-        except KeyError:
-            await interaction.response.send_message("Requested data isn't available for that server")
+            bot.server_embed = await tb_embeds.ServersEmbed.create(bot.get_channel(1099805791487266976))
+            await interaction.followup.send("New embed created.", ephemeral=True)
+        except AssertionError as err:
+            await interaction.followup.send(f"Error trying to create embed.\nError text: {err}", ephemeral=True)
 
 
 # =======BOT SETUP AND RUN=======
 
 
-bot.tree.add_command(ping)
-bot.tree.add_command(metar)
 bot.tree.add_command(info)
+bot.tree.add_command(metar)
+bot.tree.add_command(opt_in)
+bot.tree.add_command(opt_out)
+bot.tree.add_command(ping)
+bot.tree.add_command(sync_command_tree)
+bot.tree.add_command(update_embed)
 bot.run(TOKEN)
